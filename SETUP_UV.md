@@ -30,8 +30,8 @@ uv pip install -r requirements.txt
 ```bash
 uv pip install -r requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cu124 \
-  --override torch==2.*+cu124 \
-  --override torchvision==0.*+cu124
+  'torch==2.4.1+cu124' \
+  'torchvision==0.19.1+cu124'
 ```
 
 ## 4. Authenticate with HuggingFace
@@ -50,8 +50,7 @@ huggingface-cli login
 ## 5. Run the 3D viewer
 
 ```bash
-cd scripts/
-python gigatime_3d_integrated.py
+python scripts/gigatime_3d_integrated.py
 ```
 
 This starts two servers:
@@ -66,6 +65,7 @@ proxy or different public port is involved:
 export GIGATIME_HOST=0.0.0.0
 export GIGATIME_VIEWER_HOST=0.0.0.0
 # Optional behind a proxy: export GIGATIME_VIEWER_PUBLIC_URL=https://example.org/viewer
+# Optional retention period: export GIGATIME_PAYLOAD_TTL_SECONDS=3600
 python scripts/gigatime_3d_integrated.py
 ```
 

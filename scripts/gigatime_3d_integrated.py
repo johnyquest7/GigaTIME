@@ -17,7 +17,7 @@ Setup:
   Both servers start automatically.
 """
 
-import os, sys, json, base64, io, threading, tempfile, uuid
+import os, sys, json, base64, io, threading, tempfile, time, uuid
 from html import escape
 import numpy as np
 import torch
@@ -42,6 +42,7 @@ APP_PORT = int(os.environ.get("GIGATIME_PORT", "7860"))
 VIEWER_HOST = os.environ.get("GIGATIME_VIEWER_HOST", "127.0.0.1")
 VIEWER_PORT = int(os.environ.get("GIGATIME_VIEWER_PORT", "7861"))
 VIEWER_PUBLIC_URL = os.environ.get("GIGATIME_VIEWER_PUBLIC_URL", "").rstrip("/")
+PAYLOAD_TTL_SECONDS = int(os.environ.get("GIGATIME_PAYLOAD_TTL_SECONDS", "3600"))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ALL_CHANNEL_NAMES = [
@@ -123,6 +124,20 @@ def pil_to_data_url(pil_img):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
+def cleanup_expired_payloads(now=None):
+    """Remove expired per-run payloads without affecting the shared viewer HTML."""
+    cutoff = (now or time.time()) - PAYLOAD_TTL_SECONDS
+    for name in os.listdir(VIEWER_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(VIEWER_DIR, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except FileNotFoundError:
+            pass  # Another request may have removed the same expired payload.
+
+
 # ── Pipeline ──────────────────────────────────────────────────────────────────
 def run_pipeline(input_image, request: gr.Request):
     if input_image is None:
@@ -167,7 +182,8 @@ def run_pipeline(input_image, request: gr.Request):
         "dim": DS_DIM,
     }
 
-    # Use a unique payload for every run so concurrent users cannot collide.
+    # Use a unique payload for every run and discard retained user data after its TTL.
+    cleanup_expired_payloads()
     data_name = f"{uuid.uuid4().hex}.json"
     data_path = os.path.join(VIEWER_DIR, data_name)
     with open(data_path, "w") as f:
@@ -217,9 +233,12 @@ html,body{width:100%;height:100%;overflow:hidden;background:#08080f;
 .sec{padding:9px 12px;border-bottom:1px solid rgba(80,120,200,.08)}
 .tit{font-size:8px;text-transform:uppercase;letter-spacing:1.1px;color:#556;margin-bottom:4px}
 .cr{display:flex;align-items:center;gap:6px;padding:4px 5px;border-radius:4px;
-  cursor:pointer;margin-bottom:1px;transition:opacity .12s,background .1s}
+  cursor:pointer;margin-bottom:1px;transition:opacity .12s,background .1s;
+  width:100%;border:0;background:transparent;text-align:left;font:inherit;color:inherit}
 .cr:hover{background:rgba(65,105,225,.07)}
+.cr:focus-visible,#btn-tog:focus-visible{outline:1px solid #7aa2f7;outline-offset:1px}
 .cr.off{opacity:.25}
+#btn-tog{border:0;background:transparent;font:inherit;font-size:8px;color:#7aa2f7;cursor:pointer}
 input[type=range]{width:100%;accent-color:#4169E1;height:3px}
 input[type=checkbox]{accent-color:#4169E1}
 #badge{position:absolute;top:10px;left:10px;background:rgba(12,15,22,.75);
@@ -256,7 +275,9 @@ fetch(dataFile)
   .then(function(r){ return r.json(); })
   .then(function(DATA){ init(DATA); })
   .catch(function(e){
-    document.getElementById('loading').textContent = 'Error loading data: ' + e.message;
+    var loading = document.getElementById('loading');
+    loading.style.display = 'block';
+    loading.textContent = 'Error loading data: ' + e.message;
   });
 
 function init(DATA) {
@@ -328,7 +349,11 @@ function init(DATA) {
   // ── Point clouds ─────────────────────────────────────────────────────────
   var chObjs=[];
   function buildCh(){
-    for(var k=0;k<chObjs.length;k++) if(chObjs[k]) grp.remove(chObjs[k]);
+    for(var k=0;k<chObjs.length;k++) if(chObjs[k]) {
+      grp.remove(chObjs[k]);
+      chObjs[k].geometry.dispose();
+      chObjs[k].material.dispose();
+    }
     chObjs=[];
     for(var ch=0;ch<N;ch++){
       var grid=DATA.ch[ch], col=new THREE.Color(COLORS[ch]);
@@ -395,6 +420,9 @@ function init(DATA) {
   // ── Sidebar ──────────────────────────────────────────────────────────────
   var sb=document.getElementById('sb');
   function renderSB(){
+    var active=document.activeElement;
+    var focusChannel=active&&active.classList.contains('cr')?active.getAttribute('data-i'):null;
+    var focusToggle=active&&active.id==='btn-tog';
     var h='';
     h+='<div class="sec" style="background:linear-gradient(180deg,rgba(65,105,225,.06),transparent)">';
     h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">';
@@ -409,23 +437,23 @@ function init(DATA) {
     h+='<label style="font-size:9px;color:#7aa2f7;cursor:pointer;display:flex;align-items:center;gap:3px">';
     h+='<input type="checkbox" id="ck-rot"'+(autoRot?' checked':'')+'>Auto-rotate</label></div>';
     h+='<div style="margin-bottom:4px"><div style="display:flex;justify-content:space-between;font-size:8px;color:#556;margin-bottom:1px"><span>Layer spacing</span><span id="lbl-sp">'+layerSp.toFixed(2)+'</span></div>';
-    h+='<input type="range" id="sl-sp" min="0.03" max="0.35" step="0.005" value="'+layerSp+'"></div>';
+    h+='<input type="range" id="sl-sp" aria-label="Layer spacing" min="0.03" max="0.35" step="0.005" value="'+layerSp+'"></div>';
     h+='<div><div style="display:flex;justify-content:space-between;font-size:8px;color:#556;margin-bottom:1px"><span>Height scale</span><span id="lbl-el">'+elev.toFixed(2)+'</span></div>';
-    h+='<input type="range" id="sl-el" min="0.02" max="0.6" step="0.005" value="'+elev+'"></div></div>';
+    h+='<input type="range" id="sl-el" aria-label="Height scale" min="0.02" max="0.6" step="0.005" value="'+elev+'"></div></div>';
 
     var on=0; for(var j=0;j<N;j++) if(vis[j]) on++;
     h+='<div style="padding:5px 12px 2px;display:flex;justify-content:space-between;align-items:center">';
     h+='<span class="tit" style="margin:0">Channels ('+on+'/'+N+')</span>';
-    h+='<span id="btn-tog" style="font-size:8px;color:#7aa2f7;cursor:pointer">'+(on===N?'Hide all':'Show all')+'</span></div>';
+    h+='<button type="button" id="btn-tog">'+(on===N?'Hide all':'Show all')+'</button></div>';
 
     h+='<div style="flex:1;overflow-y:auto;padding:0 8px 8px">';
     for(var i=0;i<N;i++){
       var o=vis[i];
-      h+='<div class="cr'+(o?'':' off')+'" data-i="'+i+'">';
+      h+='<button type="button" class="cr'+(o?'':' off')+'" data-i="'+i+'" aria-pressed="'+o+'" aria-label="Toggle '+DATA.names[i]+'">';
       h+='<div style="width:8px;height:8px;border-radius:2px;flex-shrink:0;background:'+COLORS[i]+';'+(o?'box-shadow:0 0 4px '+COLORS[i]+'60':'')+'"></div>';
       h+='<div style="flex:1;min-width:0"><div style="font-size:10px;font-weight:600;color:'+(o?'#e0e8f4':'#445')+'">'+DATA.names[i]+'</div>';
       h+='<div style="font-size:7px;color:#445;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+DESCS[i]+'</div></div>';
-      h+='<div style="width:4px;height:4px;border-radius:50%;background:'+(o?COLORS[i]:'rgba(80,120,200,.18)')+'"></div></div>';
+      h+='<div style="width:4px;height:4px;border-radius:50%;background:'+(o?COLORS[i]:'rgba(80,120,200,.18)')+'"></div></button>';
     }
     h+='</div>';
     h+='<div style="padding:6px 12px;border-top:1px solid rgba(80,120,200,.08);font-size:7px;color:#2a3546;text-align:center;line-height:1.4">GigaTIME · Microsoft/Providence/UW · Cell 2025</div>';
@@ -455,6 +483,12 @@ function init(DATA) {
         });
       })(rows[r]);
     }
+    if(focusChannel!==null){
+      var next=document.querySelector('.cr[data-i="'+focusChannel+'"]');
+      if(next) next.focus();
+    } else if(focusToggle) {
+      document.getElementById('btn-tog').focus();
+    }
   }
   renderSB();
 }
@@ -481,14 +515,12 @@ class ViewerHandler(SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         super().end_headers()
 
+    def list_directory(self, path):
+        self.send_error(404, "Not found")
+        return None
+
     def log_message(self, format, *args):
         pass  # Quiet
-
-
-def start_viewer_server():
-    server = HTTPServer((VIEWER_HOST, VIEWER_PORT), ViewerHandler)
-    print(f"3D viewer server listening on http://{VIEWER_HOST}:{VIEWER_PORT}")
-    server.serve_forever()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -555,8 +587,10 @@ with gr.Blocks(
     run_btn.click(fn=run_pipeline, inputs=input_image, outputs=[gallery, html_viewer])
 
 if __name__ == "__main__":
-    # Start the 3D viewer HTTP server in a background thread
-    t = threading.Thread(target=start_viewer_server, daemon=True)
+    # Bind on the main thread so a port conflict prevents a broken UI startup.
+    viewer_server = HTTPServer((VIEWER_HOST, VIEWER_PORT), ViewerHandler)
+    print(f"3D viewer server listening on http://{VIEWER_HOST}:{VIEWER_PORT}")
+    t = threading.Thread(target=viewer_server.serve_forever, daemon=True)
     t.start()
 
     # Start Gradio
