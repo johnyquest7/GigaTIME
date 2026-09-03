@@ -8,23 +8,23 @@ Two-server approach:
 This bypasses all Gradio HTML sanitization issues.
 
 Setup:
-  1. Place this file in GigaTIME/scripts/ (next to archs.py)
-  2. conda activate gigatime
-  3. pip install gradio
-  4. export HF_TOKEN=<your_huggingface_token>
-  5. python gigatime_3d_integrated.py
+  1. Check out GigaTIME and change to the repository root
+  2. Install the project dependencies with `uv pip install -r requirements.txt`
+     (or `pip install -r requirements.txt`)
+  3. export HF_TOKEN=<your_huggingface_token>
+  4. python scripts/gigatime_3d_integrated.py
 
   Both servers start automatically.
 """
 
-import os, sys, json, base64, io, threading
+import os, sys, json, base64, io, threading, tempfile, uuid
+from html import escape
 import numpy as np
 import torch
 import gradio as gr
 from PIL import Image
 from huggingface_hub import snapshot_download
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-from pathlib import Path
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,10 +34,14 @@ if SCRIPT_DIR not in sys.path:
 import archs
 
 # ── Static directory for the 3D viewer ────────────────────────────────────────
-VIEWER_DIR = os.path.join(SCRIPT_DIR, "_gigatime_viewer")
+VIEWER_DIR = os.path.join(tempfile.gettempdir(), "gigatime_viewer")
 os.makedirs(VIEWER_DIR, exist_ok=True)
 
-VIEWER_PORT = 7861
+APP_HOST = os.environ.get("GIGATIME_HOST", "127.0.0.1")
+APP_PORT = int(os.environ.get("GIGATIME_PORT", "7860"))
+VIEWER_HOST = os.environ.get("GIGATIME_VIEWER_HOST", "127.0.0.1")
+VIEWER_PORT = int(os.environ.get("GIGATIME_VIEWER_PORT", "7861"))
+VIEWER_PUBLIC_URL = os.environ.get("GIGATIME_VIEWER_PUBLIC_URL", "").rstrip("/")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 ALL_CHANNEL_NAMES = [
@@ -82,7 +86,19 @@ def load_model():
     print(f"Model loaded on {device}")
     return model, device
 
-MODEL, DEVICE = load_model()
+MODEL = None
+DEVICE = None
+MODEL_LOCK = threading.Lock()
+
+
+def get_model():
+    """Load the model once, on the first inference request."""
+    global MODEL, DEVICE
+    if MODEL is None:
+        with MODEL_LOCK:
+            if MODEL is None:
+                MODEL, DEVICE = load_model()
+    return MODEL, DEVICE
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 def preprocess(pil_img):
@@ -91,13 +107,13 @@ def preprocess(pil_img):
     arr = (arr - MEAN) / STD
     return torch.from_numpy(arr.transpose(2, 0, 1)).unsqueeze(0).float()
 
-def infer(tensor):
+def infer(tensor, model):
     b, c, h, w = tensor.shape
     out = torch.zeros(b, NUM_CLASSES, h, w, device=tensor.device)
     with torch.no_grad():
         for i in range(0, h, WINDOW_SIZE):
             for j in range(0, w, WINDOW_SIZE):
-                out[:, :, i:i+WINDOW_SIZE, j:j+WINDOW_SIZE] = MODEL(
+                out[:, :, i:i+WINDOW_SIZE, j:j+WINDOW_SIZE] = model(
                     tensor[:, :, i:i+WINDOW_SIZE, j:j+WINDOW_SIZE])
     return torch.sigmoid(out).cpu().numpy()[0]
 
@@ -108,12 +124,18 @@ def pil_to_data_url(pil_img):
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
-def run_pipeline(input_image):
+def run_pipeline(input_image, request: gr.Request):
     if input_image is None:
         return [], make_placeholder("Upload an image and click Run")
 
-    tensor = preprocess(input_image).to(DEVICE)
-    probs  = infer(tensor)
+    try:
+        model, device = get_model()
+    except Exception as exc:
+        message = escape(f"Unable to load the GigaTIME model: {exc}")
+        return [], make_placeholder(message)
+
+    tensor = preprocess(input_image).to(device)
+    probs  = infer(tensor, model)
 
     he_resized = input_image.convert("RGB").resize((INPUT_SIZE, INPUT_SIZE), Image.BILINEAR)
     he_data_url = pil_to_data_url(he_resized)
@@ -145,17 +167,19 @@ def run_pipeline(input_image):
         "dim": DS_DIM,
     }
 
-    # Write data.json into the viewer directory
-    data_path = os.path.join(VIEWER_DIR, "data.json")
+    # Use a unique payload for every run so concurrent users cannot collide.
+    data_name = f"{uuid.uuid4().hex}.json"
+    data_path = os.path.join(VIEWER_DIR, data_name)
     with open(data_path, "w") as f:
         json.dump(payload, f)
 
-    # Return iframe pointing to the 3D viewer on port 7861
-    # Add timestamp to bust cache
-    import time
-    ts = int(time.time() * 1000)
+    # Use an explicit public URL behind a proxy, otherwise reuse the browser-facing
+    # Gradio hostname instead of incorrectly pointing remote users at localhost.
+    request_host = request.url.hostname or "localhost"
+    viewer_base = VIEWER_PUBLIC_URL or f"http://{request_host}:{VIEWER_PORT}"
+    viewer_url = escape(f"{viewer_base}/viewer.html?data={data_name}", quote=True)
     iframe = (
-        f'<iframe src="http://localhost:{VIEWER_PORT}/viewer.html?t={ts}" '
+        f'<iframe src="{viewer_url}" '
         f'style="width:100%;height:700px;border:none;border-radius:10px;" '
         f'allow="accelerometer;autoplay"></iframe>'
     )
@@ -218,10 +242,17 @@ input[type=checkbox]{accent-color:#4169E1}
     <div id="hint">Drag to rotate · Scroll to zoom · Toggle channels in sidebar</div>
   </div>
 </div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"
+ integrity="sha512-dLxUj8DqRLVQjaxAg/P6MqxsVXni4eWh05rq6ArlTc95xJ3Adxpv8uKXu95syEHCqB6f+GO6zkRgZNpmjDoE7A=="
+ crossorigin="anonymous"></script>
 <script>
-// Fetch data.json from the same server, then build scene
-fetch('data.json?t=' + Date.now())
+// Fetch only the UUID-scoped payload selected for this iframe.
+var dataFile = new URLSearchParams(window.location.search).get('data') || '';
+if (!/^[a-f0-9]{32}\.json$/.test(dataFile)) {
+  document.getElementById('loading').textContent = 'Invalid viewer data token';
+  throw new Error('Invalid viewer data token');
+}
+fetch(dataFile)
   .then(function(r){ return r.json(); })
   .then(function(DATA){ init(DATA); })
   .catch(function(e){
@@ -440,14 +471,13 @@ print(f"3D viewer HTML written to {viewer_html_path}")
 # ══════════════════════════════════════════════════════════════════════════════
 # HTTP server for 3D viewer (port 7861)
 # ══════════════════════════════════════════════════════════════════════════════
-class CORSHandler(SimpleHTTPRequestHandler):
-    """Serves files from VIEWER_DIR with CORS headers."""
+class ViewerHandler(SimpleHTTPRequestHandler):
+    """Serves viewer files from the isolated temporary directory."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=VIEWER_DIR, **kwargs)
 
     def end_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
         super().end_headers()
 
@@ -456,8 +486,8 @@ class CORSHandler(SimpleHTTPRequestHandler):
 
 
 def start_viewer_server():
-    server = HTTPServer(('0.0.0.0', VIEWER_PORT), CORSHandler)
-    print(f"3D viewer server running at http://localhost:{VIEWER_PORT}")
+    server = HTTPServer((VIEWER_HOST, VIEWER_PORT), ViewerHandler)
+    print(f"3D viewer server listening on http://{VIEWER_HOST}:{VIEWER_PORT}")
     server.serve_forever()
 
 
@@ -530,4 +560,4 @@ if __name__ == "__main__":
     t.start()
 
     # Start Gradio
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    demo.launch(server_name=APP_HOST, server_port=APP_PORT, share=False)

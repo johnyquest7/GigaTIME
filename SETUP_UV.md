@@ -55,8 +55,19 @@ python gigatime_3d_integrated.py
 ```
 
 This starts two servers:
-- **http://localhost:7860** — Gradio app (upload H&E, run inference, 2D gallery)
-- **http://localhost:7861** — 3D Three.js viewer (embedded via iframe)
+- **http://127.0.0.1:7860** — Gradio app (upload H&E, run inference, 2D gallery)
+- **http://127.0.0.1:7861** — 3D Three.js viewer (embedded via iframe)
+
+Both servers bind to loopback by default. To opt into LAN access, bind both
+servers explicitly and use an externally reachable viewer URL if a reverse
+proxy or different public port is involved:
+
+```bash
+export GIGATIME_HOST=0.0.0.0
+export GIGATIME_VIEWER_HOST=0.0.0.0
+# Optional behind a proxy: export GIGATIME_VIEWER_PUBLIC_URL=https://example.org/viewer
+python scripts/gigatime_3d_integrated.py
+```
 
 ## 6. Run the original notebook (optional)
 
